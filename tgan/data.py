@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 from sklearn.mixture import GaussianMixture
 from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from tensorpack import DataFlow, RNGDataFlow
 
 DEMO_DATASETS = {
@@ -304,6 +305,7 @@ class Preprocessor:
         self.metadata = metadata
         self.continous_transformer = MultiModalNumberTransformer()
         self.categorical_transformer = LabelEncoder()
+        self.scaler = StandardScaler()
         self.columns = None
 
     def fit_transform(self, data, fitting=True):
@@ -327,7 +329,8 @@ class Preprocessor:
         for i in data.columns:
             if i in self.continuous_columns:
                 column_data = data[i].values.reshape([-1, 1])
-                features, probs, means, stds = self.continous_transformer.transform(column_data)
+                column_data = self.scaler.fit_transform(column_data)
+                features, probs, means, stds = self.continous_transformer.transform(column_data)               
                 transformed_data['f%02d' % i] = np.concatenate((features, probs), axis=1)
 
                 if fitting:
