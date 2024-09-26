@@ -88,8 +88,8 @@ class GraphBuilder(ModelDescBase):
             ValueError: If any of the assignments fails or the collections are empty.
 
         """
-        self.g_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, g_scope)
-        self.d_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, d_scope)
+        self.g_vars = tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.TRAINABLE_VARIABLES, g_scope)
+        self.d_vars = tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.TRAINABLE_VARIABLES, d_scope)
 
         if not (self.g_vars or self.d_vars):
             raise ValueError('There are no variables defined in some of the given scopes')
@@ -122,7 +122,7 @@ class GraphBuilder(ModelDescBase):
                 d_loss_pos = tf.reduce_mean(
                     tf.nn.sigmoid_cross_entropy_with_logits(
                         logits=logits_real,
-                        labels=tf.ones_like(logits_real)) * 0.7 + tf.random_uniform(
+                        labels=tf.ones_like(logits_real)) * 0.7 + tf.random.uniform(
                             tf.shape(logits_real),
                             maxval=0.3
                     ),
@@ -139,18 +139,16 @@ class GraphBuilder(ModelDescBase):
                     tf.cast(score_fake < 0.5, tf.float32), name='accuracy_fake')
 
                 d_loss = 0.5 * d_loss_pos + 0.5 * d_loss_neg + \
-                    tf.contrib.layers.apply_regularization(
-                        tf.contrib.layers.l2_regularizer(l2_norm),
-                        tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, "discrim"))
+                    tf.add_n([tf.keras.regularizers.L2(l2_norm)(v) 
+                     for v in tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.TRAINABLE_VARIABLES, "discrim")])
 
                 self.d_loss = tf.identity(d_loss, name='loss')
 
             with tf.name_scope("gen"):
                 g_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
                     logits=logits_fake, labels=tf.ones_like(logits_fake))) + \
-                    tf.contrib.layers.apply_regularization(
-                        tf.contrib.layers.l2_regularizer(l2_norm),
-                        tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, 'gen'))
+                    tf.add_n([tf.keras.regularizers.L2(l2_norm)(v) 
+                     for v in tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.TRAINABLE_VARIABLES, 'gen')])
 
                 g_loss = tf.identity(g_loss, name='loss')
                 extra_g = tf.identity(extra_g, name='klloss')
@@ -255,13 +253,13 @@ class GraphBuilder(ModelDescBase):
                         value in the `type` key.
 
         """
-        with tf.variable_scope('LSTM'):
-            cell = tf.nn.rnn_cell.LSTMCell(self.num_gen_rnn)
+        with tf.compat.v1.variable_scope('LSTM'):
+            cell = tf.compat.v1.nn.rnn_cell.LSTMCell(self.num_gen_rnn)
 
             state = cell.zero_state(self.batch_size, dtype='float32')
             attention = tf.zeros(
                 shape=(self.batch_size, self.num_gen_rnn), dtype='float32')
-            input = tf.get_variable(name='go', shape=(1, self.num_gen_feature))  # <GO>
+            input = tf.compat.v1.get_variable(name='go', shape=(1, self.num_gen_feature))  # <GO>
             input = tf.tile(input, [self.batch_size, 1])
             input = tf.concat([input, z], axis=1)
 
@@ -274,11 +272,12 @@ class GraphBuilder(ModelDescBase):
                     states.append(state[1])
 
                     gaussian_components = col_info['n']
-                    with tf.variable_scope("%02d" % ptr):
+                    with tf.compat.v1.variable_scope("%02d" % ptr):
                         h = FullyConnected('FC', output, self.num_gen_feature, nl=tf.tanh)
                         outputs.append(FullyConnected('FC2', h, 1, nl=tf.tanh))
                         input = tf.concat([h, z], axis=1)
-                        attw = tf.get_variable("attw", shape=(len(states), 1, 1))
+                        with tf.compat.v1.variable_scope("attw"):
+                            attw = tf.compat.v1.get_variable("attw_var", shape=(len(states), 1, 1))
                         attw = tf.nn.softmax(attw, axis=0)
                         attention = tf.reduce_sum(tf.stack(states, axis=0) * attw, axis=0)
 
@@ -286,13 +285,14 @@ class GraphBuilder(ModelDescBase):
 
                     output, state = cell(tf.concat([input, attention], axis=1), state)
                     states.append(state[1])
-                    with tf.variable_scope("%02d" % ptr):
+                    with tf.compat.v1.variable_scope("%02d" % ptr):
                         h = FullyConnected('FC', output, self.num_gen_feature, nl=tf.tanh)
                         w = FullyConnected('FC2', h, gaussian_components, nl=tf.nn.softmax)
                         outputs.append(w)
                         input = FullyConnected('FC3', w, self.num_gen_feature, nl=tf.identity)
                         input = tf.concat([input, z], axis=1)
-                        attw = tf.get_variable("attw", shape=(len(states), 1, 1))
+                        with tf.compat.v1.variable_scope("attw"):
+                            attw = tf.compat.v1.get_variable("attw_var", shape=(len(states), 1, 1))
                         attw = tf.nn.softmax(attw, axis=0)
                         attention = tf.reduce_sum(tf.stack(states, axis=0) * attw, axis=0)
 
@@ -301,7 +301,7 @@ class GraphBuilder(ModelDescBase):
                 elif col_info['type'] == 'category':
                     output, state = cell(tf.concat([input, attention], axis=1), state)
                     states.append(state[1])
-                    with tf.variable_scope("%02d" % ptr):
+                    with tf.compat.v1.variable_scope("%02d" % ptr):
                         h = FullyConnected('FC', output, self.num_gen_feature, nl=tf.tanh)
                         w = FullyConnected('FC2', h, col_info['n'], nl=tf.nn.softmax)
                         outputs.append(w)
@@ -309,7 +309,8 @@ class GraphBuilder(ModelDescBase):
                         input = FullyConnected(
                             'FC3', one_hot, self.num_gen_feature, nl=tf.identity)
                         input = tf.concat([input, z], axis=1)
-                        attw = tf.get_variable("attw", shape=(len(states), 1, 1))
+                        with tf.compat.v1.variable_scope("attw"):
+                            attw = tf.compat.v1.get_variable("attw_var", shape=(len(states), 1, 1))
                         attw = tf.nn.softmax(attw, axis=0)
                         attention = tf.reduce_sum(tf.stack(states, axis=0) * attw, axis=0)
 
@@ -411,11 +412,11 @@ class GraphBuilder(ModelDescBase):
         """
         logits = tf.concat(vecs, axis=1)
         for i in range(self.num_dis_layers):
-            with tf.variable_scope('dis_fc{}'.format(i)):
+            with tf.compat.v1.variable_scope('dis_fc{}'.format(i)):
                 if i == 0:
                     logits = FullyConnected(
                         'fc', logits, self.num_dis_hidden, nl=tf.identity,
-                        kernel_initializer=tf.truncated_normal_initializer(stddev=0.1)
+                        kernel_initializer= tf.compat.v1.truncated_normal_initializer(stddev=0.1)
                     )
 
                 else:
@@ -440,7 +441,7 @@ class GraphBuilder(ModelDescBase):
             float: Computed divergence for the given values.
 
         """
-        return tf.reduce_sum((tf.log(pred + 1e-4) - tf.log(real + 1e-4)) * pred)
+        return tf.reduce_sum((tf.math.log(pred + 1e-4) - tf.math.log(real + 1e-4)) * pred)
 
     def build_graph(self, *inputs):
         """Build the whole graph.
@@ -452,12 +453,14 @@ class GraphBuilder(ModelDescBase):
             None
 
         """
-        z = tf.random_normal(
+        # z = tf.random_normal(
+        #     [self.batch_size, self.z_dim], name='z_train')
+        z = tf.random.normal(
             [self.batch_size, self.z_dim], name='z_train')
 
-        z = tf.placeholder_with_default(z, [None, self.z_dim], name='z')
-
-        with tf.variable_scope('gen'):
+        # z = tf.placeholder_with_default(z, [None, self.z_dim], name='z')
+        z = tf.random.normal([self.batch_size, self.z_dim], name='z')
+        with tf.compat.v1.variable_scope('gen'):
             vecs_gen = self.generator(z)
 
             vecs_denorm = []
@@ -491,7 +494,7 @@ class GraphBuilder(ModelDescBase):
                 noise_input = one_hot
 
                 if self.training:
-                    noise = tf.random_uniform(tf.shape(one_hot), minval=0, maxval=self.noise)
+                    noise = tf.random.uniform(tf.shape(one_hot), minval=0, maxval=self.noise)
                     noise_input = (one_hot + noise) / tf.reduce_sum(
                         one_hot + noise, keepdims=True, axis=1)
 
@@ -539,7 +542,7 @@ class GraphBuilder(ModelDescBase):
                         "`values`. Instead it was {}.".format(col_id, col_info['type'])
                     )
 
-        with tf.variable_scope('discrim'):
+        with tf.compat.v1.variable_scope('discrim'):
             discrim_pos = self.discriminator(vecs_pos)
             discrim_neg = self.discriminator(vecs_gen)
 
@@ -548,13 +551,14 @@ class GraphBuilder(ModelDescBase):
 
     def _get_optimizer(self):
         if self.optimizer == 'AdamOptimizer':
-            return tf.train.AdamOptimizer(self.learning_rate, 0.5)
+            return tf.optimizers.Adam(learning_rate=self.learning_rate, beta_1=0.5)
 
         elif self.optimizer == 'AdadeltaOptimizer':
-            return tf.train.AdadeltaOptimizer(self.learning_rate, 0.95)
+            return tf.optimizers.Adadelta(learning_rate=self.learning_rate, rho=0.95)
 
         else:
-            return tf.train.GradientDescentOptimizer(self.learning_rate)
+            return tf.optimizers.SGD(learning_rate=self.learning_rate)
+
 
 
 class TGANModel:
@@ -593,8 +597,8 @@ class TGANModel:
     """
 
     def __init__(
-        self, continuous_columns, output='output', gpu=None, max_epoch=5, steps_per_epoch=10000,
-        save_checkpoints=True, restore_session=True, batch_size=200, z_dim=200, noise=0.2,
+        self, continuous_columns, output='output', gpu=None, max_epoch=5, steps_per_epoch=1000,
+        save_checkpoints=True, restore_session=True, batch_size=128, z_dim=200, noise=0.2,
         l2norm=0.00001, learning_rate=0.001, num_gen_rnn=100, num_gen_feature=100,
         num_dis_layers=1, num_dis_hidden=100, optimizer='AdamOptimizer',
     ):

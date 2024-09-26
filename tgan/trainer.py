@@ -39,21 +39,31 @@ class GANTrainer(TowerTrainer):
 
         # Define the training iteration by default, run one d_min after one g_min
         with tf.name_scope('optimize'):
-            g_min_grad = opt.compute_gradients(model.g_loss, var_list=model.g_vars)
+            with tf.GradientTape() as g_tape:
+                g_loss = model.g_loss  # Ensure g_loss is computed inside the tape
+            g_min_grad = g_tape.gradient(g_loss, model.g_vars)
+
+            # Filter out None gradients
             g_min_grad_clip = [
                 (tf.clip_by_value(grad, -5.0, 5.0), var)
-                for grad, var in g_min_grad
+                for grad, var in zip(g_min_grad, model.g_vars) if grad is not None
             ]
 
             g_min_train_op = opt.apply_gradients(g_min_grad_clip, name='g_op')
+
             with tf.control_dependencies([g_min_train_op]):
-                d_min_grad = opt.compute_gradients(model.d_loss, var_list=model.d_vars)
+                with tf.GradientTape() as d_tape:
+                    d_loss = model.d_loss  # Ensure d_loss is computed inside the tape
+                d_min_grad = d_tape.gradient(d_loss, model.d_vars)
+
+                # Filter out None gradients for discriminator
                 d_min_grad_clip = [
                     (tf.clip_by_value(grad, -5.0, 5.0), var)
-                    for grad, var in d_min_grad
+                    for grad, var in zip(d_min_grad, model.d_vars) if grad is not None
                 ]
 
                 d_min_train_op = opt.apply_gradients(d_min_grad_clip, name='d_op')
+
 
         self.train_op = d_min_train_op
 
