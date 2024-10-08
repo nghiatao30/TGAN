@@ -22,7 +22,7 @@ from tensorpack import (
 from tensorpack.tfutils.scope_utils import auto_reuse_variable_scope
 from tensorpack.tfutils.summary import add_moving_summary
 from tensorpack.utils.argtools import memoized
-
+from tensorflow.keras.layers import Dense
 from tgan.data import Preprocessor, RandomZData, TGANDataFlow
 from tgan.trainer import GANTrainer
 
@@ -53,6 +53,7 @@ class GraphBuilder(ModelDescBase):
         metadata,
         batch_size=200,
         z_dim=200,
+        c_dim=10,
         noise=0.2,
         l2norm=0.00001,
         learning_rate=0.001,
@@ -67,6 +68,7 @@ class GraphBuilder(ModelDescBase):
         self.metadata = metadata
         self.batch_size = batch_size
         self.z_dim = z_dim
+        self.c_dim = c_dim
         self.noise = noise
         self.l2norm = l2norm
         self.learning_rate = learning_rate
@@ -94,30 +96,14 @@ class GraphBuilder(ModelDescBase):
         if not (self.g_vars or self.d_vars):
             raise ValueError('There are no variables defined in some of the given scopes')
 
-    def build_losses(self, logits_real, logits_fake, extra_g=0, l2_norm=0.00001):
-        r"""D and G play two-player minimax game with value function :math:`V(G,D)`.
-
-        .. math::
-
-            min_G max_D V(D, G) = IE_{x \sim p_{data}} [log D(x)] + IE_{z \sim p_{fake}}
-                [log (1 - D(G(z)))]
-
-        Args:
-            logits_real (tensorflow.Tensor): discrim logits from real samples.
-            logits_fake (tensorflow.Tensor): discrim logits from fake samples from generator.
-            extra_g(float):
-            l2_norm(float): scale to apply L2 regularization.
-
-        Returns:
-            None
-
-        """
+    def build_losses(self, logits_real, logits_fake, z, c, x_gen, extra_g=0, l2_norm=0.00001):
         with tf.name_scope("GAN_loss"):
             score_real = tf.sigmoid(logits_real)
             score_fake = tf.sigmoid(logits_fake)
             tf.summary.histogram('score-real', score_real)
             tf.summary.histogram('score-fake', score_fake)
 
+            # Discriminator loss
             with tf.name_scope("discrim"):
                 d_loss_pos = tf.reduce_mean(
                     tf.nn.sigmoid_cross_entropy_with_logits(
@@ -132,31 +118,31 @@ class GraphBuilder(ModelDescBase):
                 d_loss_neg = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
                     logits=logits_fake, labels=tf.zeros_like(logits_fake)), name='loss_fake')
 
-                d_pos_acc = tf.reduce_mean(
-                    tf.cast(score_real > 0.5, tf.float32), name='accuracy_real')
-
-                d_neg_acc = tf.reduce_mean(
-                    tf.cast(score_fake < 0.5, tf.float32), name='accuracy_fake')
-
                 d_loss = 0.5 * d_loss_pos + 0.5 * d_loss_neg + \
-                    tf.add_n([tf.keras.regularizers.L2(l2_norm)(v) 
-                     for v in tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.TRAINABLE_VARIABLES, "discrim")])
+                    tf.add_n([tf.keras.regularizers.L2(l2_norm)(v) for v in 
+                            tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.TRAINABLE_VARIABLES, "discrim")])
 
                 self.d_loss = tf.identity(d_loss, name='loss')
 
+            # Generator loss
             with tf.name_scope("gen"):
                 g_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
                     logits=logits_fake, labels=tf.ones_like(logits_fake))) + \
                     tf.add_n([tf.keras.regularizers.L2(l2_norm)(v) 
-                     for v in tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.TRAINABLE_VARIABLES, 'gen')])
+                            for v in tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.TRAINABLE_VARIABLES, 'gen')])
 
+                # Estimate latent code c using auxiliary network and compute mutual information loss
+                with tf.name_scope("mutual_information"):
+                    c_est = self.auxiliary_network(x_gen)  # Estimate latent code c from generated data
+                    mi_loss = tf.reduce_mean(tf.square(c - c_est))  # Mean squared error for mutual information
+
+                # Combine generator loss with mutual information loss
                 g_loss = tf.identity(g_loss, name='loss')
                 extra_g = tf.identity(extra_g, name='klloss')
-                self.g_loss = tf.identity(g_loss + extra_g, name='final-g-loss')
+                self.g_loss = tf.identity(g_loss + self.lambda_mi * mi_loss + extra_g, name='final-g-loss')
 
-            add_moving_summary(
-                g_loss, extra_g, self.g_loss, self.d_loss, d_pos_acc, d_neg_acc, decay=0.)
-
+            # Add summaries for TensorBoard
+            add_moving_summary(g_loss, extra_g, self.g_loss, self.d_loss, decay=0.)
     @memoized
     def get_optimizer(self):
         """Return optimizer of base class."""
@@ -198,76 +184,48 @@ class GraphBuilder(ModelDescBase):
                 )
 
         return inputs
-
-    def generator(self, z):
-        r"""Build generator graph.
-
-        We generate a numerical variable in 2 steps. We first generate the value scalar
-        :math:`v_i`, then generate the cluster vector :math:`u_i`. We generate categorical
-        feature in 1 step as a probability distribution over all possible labels.
-
-        The output and hidden state size of LSTM is :math:`n_h`. The input to the LSTM in each
-        step :math:`t` is the random variable :math:`z`, the previous hidden vector :math:`f_{t−1}`
-        or an embedding vector :math:`f^{\prime}_{t−1}` depending on the type of previous output,
-        and the weighted context vector :math:`a_{t−1}`. The random variable :math:`z` has
-        :math:`n_z` dimensions.
-        Each dimension is sampled from :math:`\mathcal{N}(0, 1)`. The attention-based context
-        vector at is a weighted average over all the previous LSTM outputs :math:`h_{1:t}`.
-        So :math:`a_t` is a :math:`n_h`-dimensional vector.
-        We learn a attention weight vector :math:`α_t \in \mathbb{R}^t` and compute context as
-
-        .. math::
-            a_t = \sum_{k=1}^{t} \frac{\textrm{exp}  {\alpha}_{t, j}}
-                {\sum_{j} \textrm{exp}  \alpha_{t,j}} h_k.
-
-        We set :math: `a_0` = 0. The output of LSTM is :math:`h_t` and we project the output to
-        a hidden vector :math:`f_t = \textrm{tanh}(W_h h_t)`, where :math:`W_h` is a learned
-        parameter in the network. The size of :math:`f_t` is :math:`n_f` .
-        We further convert the hidden vector to an output variable.
-
-        * If the output is the value part of a continuous variable, we compute the output as
-          :math:`v_i = \textrm{tanh}(W_t f_t)`. The hidden vector for :math:`t + 1` step is
-          :math:`f_t`.
-
-        * If the output is the cluster part of a continuous variable, we compute the output as
-          :math:`u_i = \textrm{softmax}(W_t f_t)`. The feature vector for :math:`t + 1` step is
-          :math:`f_t`.
-
-        * If the output is a discrete variable, we compute the output as
-          :math:`d_i = \textrm{softmax}(W_t f_t)`. The hidden vector for :math:`t + 1` step is
-          :math:`f^{\prime}_{t} = E_i [arg_k \hspace{0.25em} \textrm{max} \hspace{0.25em} d_i ]`,
-          where :math:`E \in R^{|D_i|×n_f}` is an embedding matrix for discrete variable
-          :math:`D_i`.
-
-        * :math:`f_0` is a special vector :math:`\texttt{<GO>}` and we learn it during the
-          training.
+    def auxiliary_network(self, x_gen):
+        with tf.compat.v1.variable_scope('Q_network'):
+            # A simple fully connected network to estimate c from x
+            h = Dense(128, activation='relu')(x_gen)  # First hidden layer
+            c_est = Dense(self.c_dim, activation=None)(h)
+            return c_est
+    def generator(self, z, c):
+        r"""Build generator graph with InfoGAN modifications.
+        
+        We introduce a latent code `c` for interpretable features and combine it with
+        the noise `z` for generating data. The rest of the structure (LSTM, attention mechanism)
+        remains largely the same.
 
         Args:
-            z:
-
+            z: Noise vector (tensor)
+            c: Latent code vector for interpretable features (tensor)
+            
         Returns:
-            list[tensorflow.Tensor]: Outpu
-
+            list[tensorflow.Tensor]: Output (generated data)
+        
         Raises:
-            ValueError: If any of the elements in self.metadata['details'] has an unsupported
-                        value in the `type` key.
-
+            ValueError: If any of the elements in self.metadata['details'] has an unsupported value in the `type` key.
         """
+        # Combine the noise z with the latent code c
+        input = tf.concat([z, c], axis=1)  # z and c combined as input to the generator
+        
         with tf.compat.v1.variable_scope('LSTM'):
             cell = tf.compat.v1.nn.rnn_cell.LSTMCell(self.num_gen_rnn)
 
             state = cell.zero_state(self.batch_size, dtype='float32')
             attention = tf.zeros(
                 shape=(self.batch_size, self.num_gen_rnn), dtype='float32')
-            input = tf.compat.v1.get_variable(name='go', shape=(1, self.num_gen_feature))  # <GO>
-            input = tf.tile(input, [self.batch_size, 1])
-            input = tf.concat([input, z], axis=1)
+            go_input = tf.compat.v1.get_variable(name='go', shape=(1, self.num_gen_feature))  # <GO>
+            input = tf.tile(go_input, [self.batch_size, 1])
+            input = tf.concat([input, z, c], axis=1)  # Include c with the initial input
 
             ptr = 0
             outputs = []
             states = []
             for col_id, col_info in enumerate(self.metadata['details']):
                 if col_info['type'] == 'value':
+                    # First step: generate the value scalar vi
                     output, state = cell(tf.concat([input, attention], axis=1), state)
                     states.append(state[1])
 
@@ -275,7 +233,9 @@ class GraphBuilder(ModelDescBase):
                     with tf.compat.v1.variable_scope("%02d" % ptr):
                         h = FullyConnected('FC', output, self.num_gen_feature, nl=tf.tanh)
                         outputs.append(FullyConnected('FC2', h, 1, nl=tf.tanh))
-                        input = tf.concat([h, z], axis=1)
+                        input = tf.concat([h, z, c], axis=1)  # Add c to the input
+
+                        # Attention mechanism
                         with tf.compat.v1.variable_scope("attw"):
                             attw = tf.compat.v1.get_variable("attw_var", shape=(len(states), 1, 1))
                         attw = tf.nn.softmax(attw, axis=0)
@@ -283,6 +243,7 @@ class GraphBuilder(ModelDescBase):
 
                     ptr += 1
 
+                    # Second step: generate the cluster vector ui
                     output, state = cell(tf.concat([input, attention], axis=1), state)
                     states.append(state[1])
                     with tf.compat.v1.variable_scope("%02d" % ptr):
@@ -290,7 +251,9 @@ class GraphBuilder(ModelDescBase):
                         w = FullyConnected('FC2', h, gaussian_components, nl=tf.nn.softmax)
                         outputs.append(w)
                         input = FullyConnected('FC3', w, self.num_gen_feature, nl=tf.identity)
-                        input = tf.concat([input, z], axis=1)
+                        input = tf.concat([input, z, c], axis=1)  # Include c
+
+                        # Attention mechanism
                         with tf.compat.v1.variable_scope("attw"):
                             attw = tf.compat.v1.get_variable("attw_var", shape=(len(states), 1, 1))
                         attw = tf.nn.softmax(attw, axis=0)
@@ -299,6 +262,7 @@ class GraphBuilder(ModelDescBase):
                     ptr += 1
 
                 elif col_info['type'] == 'category':
+                    # Generate categorical feature as a probability distribution
                     output, state = cell(tf.concat([input, attention], axis=1), state)
                     states.append(state[1])
                     with tf.compat.v1.variable_scope("%02d" % ptr):
@@ -308,7 +272,9 @@ class GraphBuilder(ModelDescBase):
                         one_hot = tf.one_hot(tf.argmax(w, axis=1), col_info['n'])
                         input = FullyConnected(
                             'FC3', one_hot, self.num_gen_feature, nl=tf.identity)
-                        input = tf.concat([input, z], axis=1)
+                        input = tf.concat([input, z, c], axis=1)  # Include c
+
+                        # Attention mechanism
                         with tf.compat.v1.variable_scope("attw"):
                             attw = tf.compat.v1.get_variable("attw_var", shape=(len(states), 1, 1))
                         attw = tf.nn.softmax(attw, axis=0)
@@ -321,9 +287,7 @@ class GraphBuilder(ModelDescBase):
                         "self.metadata['details'][{}]['type'] must be either `category` or "
                         "`values`. Instead it was {}.".format(col_id, col_info['type'])
                     )
-
         return outputs
-
     @staticmethod
     def batch_diversity(l, n_kernel=10, kernel_dim=10):
         r"""Return the minibatch discrimination vector.
@@ -451,18 +415,18 @@ class GraphBuilder(ModelDescBase):
 
         Returns:
             None
-
         """
-        # z = tf.random_normal(
-        #     [self.batch_size, self.z_dim], name='z_train')
-        z = tf.random.normal(
-            [self.batch_size, self.z_dim], name='z_train')
 
-        # z = tf.placeholder_with_default(z, [None, self.z_dim], name='z')
-        z = tf.random.normal([self.batch_size, self.z_dim], name='z')
+        # Generate the noise vector z
+        z = tf.random.normal([self.batch_size, self.z_dim], name='z_train')
+
+        # Generate the latent code c for interpretable features
+        c = tf.random.uniform([self.batch_size, self.c_dim], minval=-1, maxval=1, name='latent_code')
+
+        # Call the generator with both z and c
         with tf.compat.v1.variable_scope('gen'):
-            vecs_gen = self.generator(z)
-
+            vecs_gen = self.generator(z, c)
+            vecs_gen = tf.concat(vecs_gen, axis=1)
             vecs_denorm = []
             ptr = 0
             for col_id, col_info in enumerate(self.metadata['details']):
@@ -495,8 +459,7 @@ class GraphBuilder(ModelDescBase):
 
                 if self.training:
                     noise = tf.random.uniform(tf.shape(one_hot), minval=0, maxval=self.noise)
-                    noise_input = (one_hot + noise) / tf.reduce_sum(
-                        one_hot + noise, keepdims=True, axis=1)
+                    noise_input = (one_hot + noise) / tf.reduce_sum(one_hot + noise, keepdims=True, axis=1)
 
                 vecs_pos.append(noise_input)
                 ptr += 1
@@ -546,18 +509,9 @@ class GraphBuilder(ModelDescBase):
             discrim_pos = self.discriminator(vecs_pos)
             discrim_neg = self.discriminator(vecs_gen)
 
-        self.build_losses(discrim_pos, discrim_neg, extra_g=KL, l2_norm=self.l2norm)
+        # Call build_losses, passing z, c, and the generated data x_gen
+        self.build_losses(discrim_pos, discrim_neg, z, c, vecs_gen, extra_g=KL, l2_norm=self.l2norm)
         self.collect_variables()
-
-    def _get_optimizer(self):
-        if self.optimizer == 'AdamOptimizer':
-            return tf.optimizers.Adam(learning_rate=self.learning_rate, beta_1=0.5)
-
-        elif self.optimizer == 'AdadeltaOptimizer':
-            return tf.optimizers.Adadelta(learning_rate=self.learning_rate, rho=0.95)
-
-        else:
-            return tf.optimizers.SGD(learning_rate=self.learning_rate)
 
 
 

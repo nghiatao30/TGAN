@@ -125,9 +125,10 @@ class TestGraphBuilder(TensorFlowTestCase):
 
         instance = GraphBuilder(metadata)
         z = np.zeros((instance.batch_size, 100))
+        c = np.zeros((instance.batch_size, 10))  # Example latent code
 
         # Run
-        result = instance.generator(z)
+        result = instance.generator(z, c)
 
         # Check
         assert len(result) == 1
@@ -151,9 +152,10 @@ class TestGraphBuilder(TensorFlowTestCase):
 
         instance = GraphBuilder(metadata)
         z = np.zeros((instance.batch_size, 100))
+        c = np.zeros((instance.batch_size, 10))  # Example latent code
 
         # Run
-        result = instance.generator(z)
+        result = instance.generator(z, c)
 
         # Check
         assert len(result) == 2
@@ -324,12 +326,16 @@ class TestGraphBuilder(TensorFlowTestCase):
             np.full((200, 5), 1.0, dtype=np.float32),
             np.full((200, 1), 0)
         ]
+        z = np.random.normal(size=(200, instance.z_dim)).astype(np.float32)
+        c = np.random.uniform(low=-1.0, high=1.0, size=(200, instance.c_dim)).astype(np.float32)
+
+        # Mock the generated data from the generator
+        x_gen = np.random.normal(size=(200, 5)).astype(np.float32)  # Example g
         with TowerContext('', is_training=False):
             instance.build_graph(*inputs)
 
             # Run
-            result = instance.build_losses(logits_real, logits_fake, extra_g, l2_norm)
-
+            result = instance.build_losses(logits_real, logits_fake, z, c, x_gen, extra_g, l2_norm)
         # Check
         assert result is None
 
