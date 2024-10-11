@@ -7,22 +7,8 @@ from tensorpack.tfutils.tower import TowerContext, TowerFuncWrapper
 
 
 class GANTrainer(TowerTrainer):
-    """GanTrainer model.
-
-    We need to set :meth:`tower_func` because it's a :class:`TowerTrainer`, and only
-    :class:`TowerTrainer` supports automatic graph creation for inference during training.
-
-    If we don't care about inference during training, using :meth:`tower_func` is not needed.
-    Just calling :meth:`model.build_graph` directly is OK.
-
-    Args:
-        input_queue(tensorpack.input_source.QueueInput): Data input.
-        model(tgan.GAN.GANModelDesc): Model to train.
-
-    """
-
     def __init__(self, model, input_queue):
-        """Initialize object."""
+        """Initialize object with InfoGAN integration."""
         super().__init__()
         inputs_desc = model.get_inputs_desc()
 
@@ -40,10 +26,9 @@ class GANTrainer(TowerTrainer):
         # Define the training iteration by default, run one d_min after one g_min
         with tf.name_scope('optimize'):
             with tf.GradientTape() as g_tape:
-                g_loss = model.g_loss  # Ensure g_loss is computed inside the tape
+                g_loss = model.g_loss + model.mi_loss  # Tối ưu hóa với mutual information
             g_min_grad = g_tape.gradient(g_loss, model.g_vars)
 
-            # Filter out None gradients
             g_min_grad_clip = [
                 (tf.clip_by_value(grad, -5.0, 5.0), var)
                 for grad, var in zip(g_min_grad, model.g_vars) if grad is not None
@@ -53,10 +38,9 @@ class GANTrainer(TowerTrainer):
 
             with tf.control_dependencies([g_min_train_op]):
                 with tf.GradientTape() as d_tape:
-                    d_loss = model.d_loss  # Ensure d_loss is computed inside the tape
+                    d_loss = model.d_loss
                 d_min_grad = d_tape.gradient(d_loss, model.d_vars)
 
-                # Filter out None gradients for discriminator
                 d_min_grad_clip = [
                     (tf.clip_by_value(grad, -5.0, 5.0), var)
                     for grad, var in zip(d_min_grad, model.d_vars) if grad is not None
@@ -64,23 +48,12 @@ class GANTrainer(TowerTrainer):
 
                 d_min_train_op = opt.apply_gradients(d_min_grad_clip, name='d_op')
 
-
         self.train_op = d_min_train_op
 
 
 class SeparateGANTrainer(TowerTrainer):
-    """A GAN trainer which runs two optimization ops with a certain ratio.
-
-    Args:
-        input(tensorpack.input_source.QueueInput): Data input.
-        model(tgan.GAN.GANModelDesc): Model to train.
-        d_period(int): period of each d_opt run
-        g_period(int): period of each g_opt run
-
-    """
-
     def __init__(self, input, model, d_period=1, g_period=1):
-        """Initialize object."""
+        """Initialize object with InfoGAN integration."""
         super(SeparateGANTrainer, self).__init__()
         self._d_period = int(d_period)
         self._g_period = int(g_period)
@@ -98,10 +71,12 @@ class SeparateGANTrainer(TowerTrainer):
 
         opt = model.get_optimizer()
         with tf.name_scope('optimize'):
-            self.d_min = opt.minimize(
-                model.d_loss, var_list=model.d_vars, name='d_min')
+            self.d_min = opt.minimize(model.d_loss, var_list=model.d_vars, name='d_min')
             self.g_min = opt.minimize(
-                model.g_loss, var_list=model.g_vars, name='g_min')
+                model.g_loss + model.mi_loss,  # Thêm mutual information vào mất mát của generator
+                var_list=model.g_vars,
+                name='g_min'
+            )
 
     def run_step(self):
         """Define the training iteration."""

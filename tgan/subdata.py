@@ -152,20 +152,22 @@ class TGANDataFlow(RNGDataFlow):
 
 
 class RandomZData(DataFlow):
-    """Random dataflow for generating z and c tensors."""
+    """Random dataflow.
 
-    def __init__(self, z_shape, c_dim):
-        """Initialize object with z and c shapes."""
+    Args:
+        shape(tuple): Shape of the array to return on :meth:`get_data`
+
+    """
+
+    def __init__(self, shape):
+        """Initialize object."""
         super(RandomZData, self).__init__()
-        self.z_shape = z_shape
-        self.c_dim = c_dim
+        self.shape = shape
 
     def get_data(self):
-        """Yield random normal vectors of shape :attr:`z_shape` and uniform vectors of shape :attr:`c_dim`."""
+        """Yield random normal vectors of shape :attr:`shape`."""
         while True:
-            z = np.random.normal(0, 1, size=self.z_shape)  # Noise vector
-            c = np.random.uniform(-1, 1, size=(self.z_shape[0], self.c_dim))  # Latent code
-            yield [z, c]  # Return both z and c
+            yield [np.random.normal(0, 1, size=self.shape)]
 
     def __iter__(self):
         """Return data."""
@@ -173,7 +175,7 @@ class RandomZData(DataFlow):
 
     def __len__(self):
         """Length of batches."""
-        return self.z_shape[0]
+        return self.shape[0]
 
 
 class MultiModalNumberTransformer:

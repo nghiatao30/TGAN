@@ -48,25 +48,14 @@ class GraphBuilder(ModelDescBase):
 
     """
 
-    def __init__(
-        self,
-        metadata,
-        batch_size=200,
-        z_dim=200,
-        noise=0.2,
-        l2norm=0.00001,
-        learning_rate=0.001,
-        num_gen_rnn=100,
-        num_gen_feature=100,
-        num_dis_layers=1,
-        num_dis_hidden=100,
-        optimizer='AdamOptimizer',
-        training=True
-    ):
-        """Initialize the object, set arguments as attributes."""
+    def __init__(self, metadata, batch_size=200, z_dim=200, c_dim=10, noise=0.2, l2norm=0.00001, 
+                 learning_rate=0.001, num_gen_rnn=100, num_gen_feature=100, num_dis_layers=1, 
+                 num_dis_hidden=100, optimizer='AdamOptimizer', training=True):
+        super().__init__()
         self.metadata = metadata
         self.batch_size = batch_size
         self.z_dim = z_dim
+        self.c_dim = c_dim  # thêm số chiều của biến có thể kiểm soát
         self.noise = noise
         self.l2norm = l2norm
         self.learning_rate = learning_rate
@@ -76,6 +65,8 @@ class GraphBuilder(ModelDescBase):
         self.num_dis_hidden = num_dis_hidden
         self.optimizer = optimizer
         self.training = training
+        self.mi_loss = None
+
 
     def collect_variables(self, g_scope='gen', d_scope='discrim'):
         """Assign generator and discriminator variables from their scopes.
@@ -199,83 +190,44 @@ class GraphBuilder(ModelDescBase):
 
         return inputs
 
-    def generator(self, z):
-        r"""Build generator graph.
-
-        We generate a numerical variable in 2 steps. We first generate the value scalar
-        :math:`v_i`, then generate the cluster vector :math:`u_i`. We generate categorical
-        feature in 1 step as a probability distribution over all possible labels.
-
-        The output and hidden state size of LSTM is :math:`n_h`. The input to the LSTM in each
-        step :math:`t` is the random variable :math:`z`, the previous hidden vector :math:`f_{t−1}`
-        or an embedding vector :math:`f^{\prime}_{t−1}` depending on the type of previous output,
-        and the weighted context vector :math:`a_{t−1}`. The random variable :math:`z` has
-        :math:`n_z` dimensions.
-        Each dimension is sampled from :math:`\mathcal{N}(0, 1)`. The attention-based context
-        vector at is a weighted average over all the previous LSTM outputs :math:`h_{1:t}`.
-        So :math:`a_t` is a :math:`n_h`-dimensional vector.
-        We learn a attention weight vector :math:`α_t \in \mathbb{R}^t` and compute context as
-
-        .. math::
-            a_t = \sum_{k=1}^{t} \frac{\textrm{exp}  {\alpha}_{t, j}}
-                {\sum_{j} \textrm{exp}  \alpha_{t,j}} h_k.
-
-        We set :math: `a_0` = 0. The output of LSTM is :math:`h_t` and we project the output to
-        a hidden vector :math:`f_t = \textrm{tanh}(W_h h_t)`, where :math:`W_h` is a learned
-        parameter in the network. The size of :math:`f_t` is :math:`n_f` .
-        We further convert the hidden vector to an output variable.
-
-        * If the output is the value part of a continuous variable, we compute the output as
-          :math:`v_i = \textrm{tanh}(W_t f_t)`. The hidden vector for :math:`t + 1` step is
-          :math:`f_t`.
-
-        * If the output is the cluster part of a continuous variable, we compute the output as
-          :math:`u_i = \textrm{softmax}(W_t f_t)`. The feature vector for :math:`t + 1` step is
-          :math:`f_t`.
-
-        * If the output is a discrete variable, we compute the output as
-          :math:`d_i = \textrm{softmax}(W_t f_t)`. The hidden vector for :math:`t + 1` step is
-          :math:`f^{\prime}_{t} = E_i [arg_k \hspace{0.25em} \textrm{max} \hspace{0.25em} d_i ]`,
-          where :math:`E \in R^{|D_i|×n_f}` is an embedding matrix for discrete variable
-          :math:`D_i`.
-
-        * :math:`f_0` is a special vector :math:`\texttt{<GO>}` and we learn it during the
-          training.
-
-        Args:
-            z:
-
-        Returns:
-            list[tensorflow.Tensor]: Outpu
-
-        Raises:
-            ValueError: If any of the elements in self.metadata['details'] has an unsupported
-                        value in the `type` key.
-
-        """
+    def generator(self, z, c):
+        """Build generator graph with control variable 'c' for InfoGAN."""
         with tf.compat.v1.variable_scope('LSTM'):
+            # Combine z and c into a single input vector
+            input_combined = tf.concat([z, c], axis=1)
+
+            # Project input_combined to match the num_gen_feature
+            input_combined = FullyConnected('input_fc', input_combined, self.num_gen_feature, nl=tf.nn.relu)
+
+            # Initialize LSTM cell with num_gen_rnn units
             cell = tf.compat.v1.nn.rnn_cell.LSTMCell(self.num_gen_rnn)
 
+            # Zero initial state for LSTM
             state = cell.zero_state(self.batch_size, dtype='float32')
-            attention = tf.zeros(
-                shape=(self.batch_size, self.num_gen_rnn), dtype='float32')
-            input = tf.compat.v1.get_variable(name='go', shape=(1, self.num_gen_feature))  # <GO>
+
+            # Initialize the attention mechanism
+            attention = tf.zeros(shape=(self.batch_size, self.num_gen_rnn), dtype='float32')
+
+            # Initialize <GO> token for LSTM input and combine with input_combined
+            input = tf.compat.v1.get_variable(name='go', shape=(1, self.num_gen_feature))
             input = tf.tile(input, [self.batch_size, 1])
-            input = tf.concat([input, z], axis=1)
+            input = tf.concat([input, input_combined], axis=1)
 
             ptr = 0
             outputs = []
             states = []
             for col_id, col_info in enumerate(self.metadata['details']):
                 if col_info['type'] == 'value':
+                    # Pass through LSTM cell with attention
                     output, state = cell(tf.concat([input, attention], axis=1), state)
                     states.append(state[1])
 
+                    # Process continuous feature
                     gaussian_components = col_info['n']
                     with tf.compat.v1.variable_scope("%02d" % ptr):
                         h = FullyConnected('FC', output, self.num_gen_feature, nl=tf.tanh)
                         outputs.append(FullyConnected('FC2', h, 1, nl=tf.tanh))
-                        input = tf.concat([h, z], axis=1)
+                        input = tf.concat([h, input_combined], axis=1)
                         with tf.compat.v1.variable_scope("attw"):
                             attw = tf.compat.v1.get_variable("attw_var", shape=(len(states), 1, 1))
                         attw = tf.nn.softmax(attw, axis=0)
@@ -290,7 +242,7 @@ class GraphBuilder(ModelDescBase):
                         w = FullyConnected('FC2', h, gaussian_components, nl=tf.nn.softmax)
                         outputs.append(w)
                         input = FullyConnected('FC3', w, self.num_gen_feature, nl=tf.identity)
-                        input = tf.concat([input, z], axis=1)
+                        input = tf.concat([input, input_combined], axis=1)
                         with tf.compat.v1.variable_scope("attw"):
                             attw = tf.compat.v1.get_variable("attw_var", shape=(len(states), 1, 1))
                         attw = tf.nn.softmax(attw, axis=0)
@@ -306,9 +258,8 @@ class GraphBuilder(ModelDescBase):
                         w = FullyConnected('FC2', h, col_info['n'], nl=tf.nn.softmax)
                         outputs.append(w)
                         one_hot = tf.one_hot(tf.argmax(w, axis=1), col_info['n'])
-                        input = FullyConnected(
-                            'FC3', one_hot, self.num_gen_feature, nl=tf.identity)
-                        input = tf.concat([input, z], axis=1)
+                        input = FullyConnected('FC3', one_hot, self.num_gen_feature, nl=tf.identity)
+                        input = tf.concat([input, input_combined], axis=1)
                         with tf.compat.v1.variable_scope("attw"):
                             attw = tf.compat.v1.get_variable("attw_var", shape=(len(states), 1, 1))
                         attw = tf.nn.softmax(attw, axis=0)
@@ -323,6 +274,13 @@ class GraphBuilder(ModelDescBase):
                     )
 
         return outputs
+
+    def calculate_attention(self, states):
+        """Helper function to calculate attention weights and apply them."""
+        with tf.compat.v1.variable_scope("attw"):
+            attw = tf.compat.v1.get_variable("attw_var", shape=(len(states), 1, 1))
+        attw = tf.nn.softmax(attw, axis=0)
+        return tf.reduce_sum(tf.stack(states, axis=0) * attw, axis=0)
 
     @staticmethod
     def batch_diversity(l, n_kernel=10, kernel_dim=10):
@@ -442,27 +400,31 @@ class GraphBuilder(ModelDescBase):
 
         """
         return tf.reduce_sum((tf.math.log(pred + 1e-4) - tf.math.log(real + 1e-4)) * pred)
-
+    def mutual_information(self, c_real, c_pred):
+        # Tính toán mutual information cho phần biến kiểm soát c
+        cross_ent = tf.reduce_mean(
+            tf.nn.softmax_cross_entropy_with_logits(logits=c_pred, labels=c_real))
+        return cross_ent
+    def q_network(self, inputs):
+        """Define the Q-network to predict the latent code c."""
+        with tf.compat.v1.variable_scope('q_network'):
+            if isinstance(inputs, list):
+                inputs = tf.concat(inputs, axis=-1)
+            # Define Q-network layers
+            q_hidden = tf.keras.layers.Dense(128, activation=tf.nn.relu, name='q_hidden')(inputs)
+            q_output = tf.keras.layers.Dense(self.c_dim, activation=None, name='q_output')(q_hidden)
+        return q_output
     def build_graph(self, *inputs):
-        """Build the whole graph.
+        """Build the whole graph with InfoGAN structure."""
 
-        Args:
-            inputs(list[tensorflow.Tensor]):
+        # Tạo các biến nhiễu z và biến kiểm soát c
+        z = tf.random.normal([self.batch_size, self.z_dim], name='z_train') # số chiều của biến kiểm soát c
+        c = tf.random.uniform([self.batch_size, self.c_dim], minval=-1, maxval=1, name='c')  # Biến kiểm soát
 
-        Returns:
-            None
-
-        """
-        # z = tf.random_normal(
-        #     [self.batch_size, self.z_dim], name='z_train')
-        z = tf.random.normal(
-            [self.batch_size, self.z_dim], name='z_train')
-
-        # z = tf.placeholder_with_default(z, [None, self.z_dim], name='z')
-        z = tf.random.normal([self.batch_size, self.z_dim], name='z')
+        # Sử dụng z và c làm đầu vào của generator
         with tf.compat.v1.variable_scope('gen'):
-            vecs_gen = self.generator(z)
-
+            vecs_gen = self.generator(z, c)
+            combined_outputs = tf.concat(vecs_gen, axis=1)
             vecs_denorm = []
             ptr = 0
             for col_id, col_info in enumerate(self.metadata['details']):
@@ -471,21 +433,19 @@ class GraphBuilder(ModelDescBase):
                     t = tf.cast(tf.reshape(t, [-1, 1]), 'float32')
                     vecs_denorm.append(t)
                     ptr += 1
-
                 elif col_info['type'] == 'value':
                     vecs_denorm.append(vecs_gen[ptr])
                     ptr += 1
                     vecs_denorm.append(vecs_gen[ptr])
                     ptr += 1
-
                 else:
                     raise ValueError(
                         "self.metadata['details'][{}]['type'] must be either `category` or "
                         "`values`. Instead it was {}.".format(col_id, col_info['type'])
                     )
-
             tf.identity(tf.concat(vecs_denorm, axis=1), name='gen')
 
+        # Xử lý các đầu vào thật
         vecs_pos = []
         ptr = 0
         for col_id, col_info in enumerate(self.metadata['details']):
@@ -500,19 +460,24 @@ class GraphBuilder(ModelDescBase):
 
                 vecs_pos.append(noise_input)
                 ptr += 1
-
             elif col_info['type'] == 'value':
                 vecs_pos.append(inputs[ptr])
                 ptr += 1
                 vecs_pos.append(inputs[ptr])
                 ptr += 1
-
             else:
                 raise ValueError(
                     "self.metadata['details'][{}]['type'] must be either `category` or "
                     "`values`. Instead it was {}.".format(col_id, col_info['type'])
                 )
 
+        # Tính toán mutual information giữa c và vecs_gen
+        with tf.compat.v1.variable_scope('mutual_info'):
+            # Thêm một thành phần vào discriminant để dự đoán lại c từ đầu ra của generator
+            pred_c = self.q_network(vecs_gen)
+            mi_loss = -tf.reduce_mean(tf.reduce_sum(c * tf.math.log(pred_c + 1e-8), axis=1))
+
+        # Tính toán KL Divergence cho các biến continuous
         KL = 0.
         ptr = 0
         if self.training:
@@ -520,12 +485,10 @@ class GraphBuilder(ModelDescBase):
                 if col_info['type'] == 'category':
                     dist = tf.reduce_sum(vecs_gen[ptr], axis=0)
                     dist = dist / tf.reduce_sum(dist)
-
                     real = tf.reduce_sum(vecs_pos[ptr], axis=0)
                     real = real / tf.reduce_sum(real)
                     KL += self.compute_kl(real, dist)
                     ptr += 1
-
                 elif col_info['type'] == 'value':
                     ptr += 1
                     dist = tf.reduce_sum(vecs_gen[ptr], axis=0)
@@ -533,21 +496,18 @@ class GraphBuilder(ModelDescBase):
                     real = tf.reduce_sum(vecs_pos[ptr], axis=0)
                     real = real / tf.reduce_sum(real)
                     KL += self.compute_kl(real, dist)
-
                     ptr += 1
-
-                else:
-                    raise ValueError(
-                        "self.metadata['details'][{}]['type'] must be either `category` or "
-                        "`values`. Instead it was {}.".format(col_id, col_info['type'])
-                    )
-
+        q_pred = self.q_network(combined_outputs)
+        self.mi_loss = tf.reduce_mean(tf.square(c - q_pred))
+        # Tính toán mất mát của discriminant
         with tf.compat.v1.variable_scope('discrim'):
             discrim_pos = self.discriminator(vecs_pos)
             discrim_neg = self.discriminator(vecs_gen)
 
-        self.build_losses(discrim_pos, discrim_neg, extra_g=KL, l2_norm=self.l2norm)
+        # Gộp mi_loss vào mất mát của generator và discriminant
+        self.build_losses(discrim_pos, discrim_neg, extra_g=KL + mi_loss, l2_norm=self.l2norm)
         self.collect_variables()
+
 
     def _get_optimizer(self):
         if self.optimizer == 'AdamOptimizer':
@@ -597,8 +557,8 @@ class TGANModel:
     """
 
     def __init__(
-        self, continuous_columns, output='output', gpu=None, max_epoch=5, steps_per_epoch=1000,
-        save_checkpoints=True, restore_session=True, batch_size=128, z_dim=200, noise=0.2,
+        self, continuous_columns, output='output', gpu=None, max_epoch=5, steps_per_epoch=10000,
+        save_checkpoints=True, restore_session=True, batch_size=200, z_dim=200,c_dim = 10, noise=0.2,
         l2norm=0.00001, learning_rate=0.001, num_gen_rnn=100, num_gen_feature=100,
         num_dis_layers=1, num_dis_hidden=100, optimizer='AdamOptimizer',
     ):
@@ -619,6 +579,7 @@ class TGANModel:
         self.model = None
         self.batch_size = batch_size
         self.z_dim = z_dim
+        self.c_dim = c_dim
         self.noise = noise
         self.l2norm = l2norm
         self.learning_rate = learning_rate
@@ -651,24 +612,26 @@ class TGANModel:
         )
 
     def prepare_sampling(self):
-        """Prepare model for generate samples."""
+        """Prepare model for generating samples."""
         if self.model is None:
             self.model = self.get_model(training=False)
-
         else:
             self.model.training = False
 
+        # Ensure input_names and output_names are correct
         predict_config = PredictConfig(
             session_init=SaverRestore(self.restore_path),
             model=self.model,
-            input_names=['z'],
-            output_names=['gen/gen', 'z'],
+            input_names=['z_train', 'c'],  # Use the names defined in build_graph
+            output_names=['gen/gen', 'z_train', 'c']
         )
 
+        # Pass both z and c to RandomZData
         self.simple_dataset_predictor = SimpleDatasetPredictor(
             predict_config,
-            RandomZData((self.batch_size, self.z_dim))
+            RandomZData((self.batch_size, self.z_dim), self.c_dim)  # Provide both z and c dimensions
         )
+
 
     def fit(self, data):
         """Fit the model to the given data.
@@ -778,7 +741,7 @@ class TGANModel:
             tar_handle.close()
 
     @classmethod
-    def load(cls, path):
+    def load(cls, path, c_dim = 10):
         """Load a pretrained model from a given path."""
         with tarfile.open(path, 'r:gz') as tar_handle:
             destination_dir = os.path.dirname(tar_handle.getmembers()[0].name)
@@ -786,7 +749,7 @@ class TGANModel:
 
         with open('{}/TGANModel'.format(destination_dir), 'rb') as f:
             instance = pickle.load(f)
-
+        instance.c_dim = c_dim
         instance.prepare_sampling()
         return instance
 
